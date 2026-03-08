@@ -1,5 +1,3 @@
-from flask import Flask
-from threading import Thread
 import os
 import sqlite3
 from pathlib import Path
@@ -816,6 +814,10 @@ async def registro_cancelar(interaction: discord.Interaction, registro: str):
         f"🧹 {BOT_PERSONA} cancelou **{row['titulo']}** e guardou esse pergaminho para não poluir a agenda.",
         ephemeral=True,
     )
+
+from flask import Flask
+from threading import Thread
+import os
 
 app = Flask(__name__)
 
