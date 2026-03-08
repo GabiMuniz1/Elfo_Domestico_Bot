@@ -1,1 +1,1 @@
-worker: python elfo_domestico_agenda_magica_v6_multiserver.py
+worker: python hogwarts_agenda_bot_v2.py
