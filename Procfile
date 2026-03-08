@@ -1,0 +1,1 @@
+worker: python elfo_domestico_agenda_magica_v6_multiserver.py
