@@ -815,23 +815,4 @@ async def registro_cancelar(interaction: discord.Interaction, registro: str):
         ephemeral=True,
     )
 
-from flask import Flask
-from threading import Thread
-import os
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Mispy está acordado e cuidando da Agenda Mágica!"
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-def keep_alive():
-    t = Thread(target=run_web, daemon=True)
-    t.start()
-
-keep_alive()
 bot.run(TOKEN)
