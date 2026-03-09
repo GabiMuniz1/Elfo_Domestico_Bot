@@ -9,6 +9,9 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 
+from zoneinfo import ZoneInfo
+from datetime import datetime
+
 # =========================
 # Configuração
 # =========================
@@ -38,7 +41,7 @@ intents.guilds = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
+FUSO_BRASIL = ZoneInfo("America/Sao_Paulo")
 # =========================
 # Banco de dados
 # =========================
