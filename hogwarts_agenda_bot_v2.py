@@ -2,19 +2,14 @@ import os
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional
+from zoneinfo import ZoneInfo
+from typing import Optional, List
 
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 
-from zoneinfo import ZoneInfo
-from datetime import datetime
-
-# =========================
-# Configuração
-# =========================
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
@@ -22,26 +17,46 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Defina a variável de ambiente DISCORD_TOKEN antes de iniciar o bot.")
 
-DB_PATH = os.getenv("AGENDA_DB_PATH", "agenda_hogwarts.db")
+GUILD_ID = int(os.getenv("DEFAULT_GUILD_ID", "0")) or None
+CANAL_DIRETORIA_ID = int(os.getenv("CANAL_DIRETORIA_ID", "0")) or None
 ANTECEDENCIA_PADRAO = int(os.getenv("ANTECEDENCIA_PADRAO", "10"))
-STAFF_ROLES = {
-    item.strip()
-    for item in os.getenv(
-        "STAFF_ROLES",
-        "Diretor,Vice-Diretor,Professores,Monitores",
-    ).split(",")
-    if item.strip()
-}
+DB_PATH = os.getenv("AGENDA_DB_PATH", "agenda_hogwarts.db")
+STAFF_ROLES = [r.strip() for r in os.getenv("STAFF_ROLES", "Monitor,Professor,Diretor,Funcionário").split(",") if r.strip()]
 BOT_PERSONA = "Mispy"
 SYSTEM_NAME = "Agenda Mágica"
+DATE_FMT_INPUT = "%d/%m/%Y %H:%M"
 DATE_FMT_DB = "%Y-%m-%d %H:%M:%S"
+FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
+
+
+def now_brasilia() -> datetime:
+    return datetime.now(FUSO_BRASILIA)
+
+
+def to_db_dt(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=FUSO_BRASILIA)
+    return dt.astimezone(FUSO_BRASILIA).isoformat(timespec="seconds")
+
+
+def from_db_dt(value: str) -> datetime:
+    value = value.strip()
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        dt = datetime.strptime(value, DATE_FMT_DB)
+        dt = dt.replace(tzinfo=FUSO_BRASILIA)
+    else:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=FUSO_BRASILIA)
+    return dt.astimezone(FUSO_BRASILIA)
 
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-FUSO_BRASIL = ZoneInfo("America/Sao_Paulo")
+
 # =========================
 # Banco de dados
 # =========================
@@ -61,7 +76,6 @@ class Database:
                 """
                 CREATE TABLE IF NOT EXISTS registros (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
                     kind TEXT NOT NULL,
                     titulo TEXT NOT NULL,
                     descricao TEXT,
@@ -79,43 +93,38 @@ class Database:
                 )
                 """
             )
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(registros)").fetchall()]
-            if "guild_id" not in cols:
-                conn.execute("ALTER TABLE registros ADD COLUMN guild_id INTEGER DEFAULT 0")
 
     def create_record(
         self,
         *,
-        guild_id: int,
         kind: str,
         titulo: str,
         descricao: str,
         starts_at: datetime,
         voice_channel_id: Optional[int],
         role_id: Optional[int],
-        participant_ids: list[int],
+        participant_ids: Optional[List[int]],
         created_by: int,
         notify_before: int,
     ) -> int:
-        now = datetime.now().strftime(DATE_FMT_DB)
+        now = to_db_dt(now_brasilia())
         with self._conn() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO registros (
-                    guild_id, kind, titulo, descricao, starts_at,
-                    voice_channel_id, role_id, participant_ids, created_by,
-                    notify_before, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    kind, titulo, descricao, starts_at, voice_channel_id,
+                    role_id, participant_ids, created_by, notify_before,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    guild_id,
                     kind,
                     titulo,
                     descricao,
-                    starts_at.strftime(DATE_FMT_DB),
+                    to_db_dt(starts_at),
                     voice_channel_id,
                     role_id,
-                    ",".join(map(str, participant_ids)),
+                    ",".join(map(str, participant_ids or [])),
                     created_by,
                     notify_before,
                     now,
@@ -127,14 +136,13 @@ class Database:
     def update_record(
         self,
         record_id: int,
-        guild_id: int,
         *,
         titulo: Optional[str] = None,
         descricao: Optional[str] = None,
         starts_at: Optional[datetime] = None,
         voice_channel_id: Optional[int] = None,
         notify_before: Optional[int] = None,
-    ) -> bool:
+    ):
         fields = []
         values = []
         if titulo is not None:
@@ -145,7 +153,7 @@ class Database:
             values.append(descricao)
         if starts_at is not None:
             fields.append("starts_at = ?")
-            values.append(starts_at.strftime(DATE_FMT_DB))
+            values.append(to_db_dt(starts_at))
             fields.append("notify_sent = 0")
             fields.append("start_sent = 0")
         if voice_channel_id is not None:
@@ -154,112 +162,76 @@ class Database:
         if notify_before is not None:
             fields.append("notify_before = ?")
             values.append(notify_before)
-            fields.append("notify_sent = 0")
-        if not fields:
-            return False
         fields.append("updated_at = ?")
-        values.append(datetime.now().strftime(DATE_FMT_DB))
-        values.extend([record_id, guild_id])
+        values.append(to_db_dt(now_brasilia()))
+        values.append(record_id)
+        with self._conn() as conn:
+            conn.execute(f"UPDATE registros SET {', '.join(fields)} WHERE id = ?", values)
+
+    def cancel_record(self, record_id: int):
         with self._conn() as conn:
             conn.execute(
-                f"UPDATE registros SET {', '.join(fields)} WHERE id = ? AND guild_id = ?",
-                values,
-            )
-        return True
-
-    def cancel_record(self, record_id: int, guild_id: int):
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE registros SET canceled = 1, updated_at = ? WHERE id = ? AND guild_id = ?",
-                (datetime.now().strftime(DATE_FMT_DB), record_id, guild_id),
+                "UPDATE registros SET canceled = 1, updated_at = ? WHERE id = ?",
+                (to_db_dt(now_brasilia()), record_id),
             )
 
-    def record_by_id(self, record_id: int, guild_id: int):
+    def get_record(self, record_id: int):
         with self._conn() as conn:
-            cur = conn.execute(
-                "SELECT * FROM registros WHERE id = ? AND guild_id = ?",
-                (record_id, guild_id),
-            )
+            cur = conn.execute("SELECT * FROM registros WHERE id = ?", (record_id,))
             return cur.fetchone()
 
-    def autocomplete_records(self, guild_id: int):
-        cutoff = (datetime.now() - timedelta(days=1)).strftime(DATE_FMT_DB)
+    def upcoming_for_user(self, user_id: int):
+        now = to_db_dt(now_brasilia())
         with self._conn() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM registros
-                WHERE guild_id = ? AND canceled = 0 AND starts_at >= ?
+                WHERE canceled = 0 AND starts_at >= ?
+                  AND (participant_ids LIKE ? OR participant_ids LIKE ? OR participant_ids LIKE ? OR participant_ids = ?)
                 ORDER BY starts_at ASC
                 LIMIT 25
                 """,
-                (guild_id, cutoff),
+                (now, f"{user_id},%", f"%,{user_id},%", f"%,{user_id}", str(user_id)),
             )
             return cur.fetchall()
 
-    def upcoming_for_user(self, guild_id: int, user_id: int):
-        now = datetime.now().strftime(DATE_FMT_DB)
-        pattern_a = f"{user_id},%"
-        pattern_b = f"%,{user_id},%"
-        pattern_c = f"%,{user_id}"
-        with self._conn() as conn:
-            cur = conn.execute(
-                """
-                SELECT * FROM registros
-                WHERE guild_id = ?
-                  AND canceled = 0
-                  AND starts_at >= ?
-                  AND (
-                    participant_ids = ? OR participant_ids LIKE ? OR participant_ids LIKE ? OR participant_ids LIKE ?
-                  )
-                ORDER BY starts_at ASC
-                LIMIT 25
-                """,
-                (guild_id, now, str(user_id), pattern_a, pattern_b, pattern_c),
-            )
-            return cur.fetchall()
-
-    def today_for_user(self, guild_id: int, user_id: int):
-        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    def today_for_user(self, user_id: int):
+        start = now_brasilia().replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
-        pattern_a = f"{user_id},%"
-        pattern_b = f"%,{user_id},%"
-        pattern_c = f"%,{user_id}"
         with self._conn() as conn:
             cur = conn.execute(
                 """
                 SELECT * FROM registros
-                WHERE guild_id = ?
-                  AND canceled = 0
-                  AND starts_at >= ?
-                  AND starts_at < ?
-                  AND (
-                    participant_ids = ? OR participant_ids LIKE ? OR participant_ids LIKE ? OR participant_ids LIKE ?
-                  )
+                WHERE canceled = 0 AND starts_at >= ? AND starts_at < ?
+                  AND (participant_ids LIKE ? OR participant_ids LIKE ? OR participant_ids LIKE ? OR participant_ids = ?)
                 ORDER BY starts_at ASC
                 """,
                 (
-                    guild_id,
-                    start.strftime(DATE_FMT_DB),
-                    end.strftime(DATE_FMT_DB),
+                    to_db_dt(start),
+                    to_db_dt(end),
+                    f"{user_id},%",
+                    f"%,{user_id},%",
+                    f"%,{user_id}",
                     str(user_id),
-                    pattern_a,
-                    pattern_b,
-                    pattern_c,
                 ),
             )
             return cur.fetchall()
 
-    def upcoming_staff(self, guild_id: int):
-        now = datetime.now().strftime(DATE_FMT_DB)
+    def upcoming_staff(self):
+        now = to_db_dt(now_brasilia())
         with self._conn() as conn:
             cur = conn.execute(
-                """
-                SELECT * FROM registros
-                WHERE guild_id = ? AND canceled = 0 AND starts_at >= ?
-                ORDER BY starts_at ASC
-                LIMIT 25
-                """,
-                (guild_id, now),
+                "SELECT * FROM registros WHERE canceled = 0 AND starts_at >= ? ORDER BY starts_at ASC LIMIT 25",
+                (now,),
+            )
+            return cur.fetchall()
+
+    def autocomplete_records(self):
+        now = to_db_dt(now_brasilia() - timedelta(days=1))
+        with self._conn() as conn:
+            cur = conn.execute(
+                "SELECT * FROM registros WHERE canceled = 0 AND starts_at >= ? ORDER BY starts_at ASC LIMIT 25",
+                (now,),
             )
             return cur.fetchall()
 
@@ -270,16 +242,8 @@ class Database:
             )
             return cur.fetchall()
 
-    def mark_notify_sent(self, record_id: int):
-        with self._conn() as conn:
-            conn.execute("UPDATE registros SET notify_sent = 1 WHERE id = ?", (record_id,))
-
-    def mark_start_sent(self, record_id: int):
-        with self._conn() as conn:
-            conn.execute("UPDATE registros SET start_sent = 1 WHERE id = ?", (record_id,))
-
-    def cleanup_old(self):
-        cutoff = (datetime.now() - timedelta(hours=12)).strftime(DATE_FMT_DB)
+    def delete_old(self):
+        cutoff = to_db_dt(now_brasilia() - timedelta(days=1))
         with self._conn() as conn:
             conn.execute("DELETE FROM registros WHERE starts_at < ?", (cutoff,))
 
@@ -290,219 +254,99 @@ db = Database(DB_PATH)
 # =========================
 # Utilitários
 # =========================
-def ensure_guild(interaction: discord.Interaction) -> Optional[discord.Guild]:
-    return interaction.guild
-
-
 def is_staff(member: discord.Member) -> bool:
     return any(role.name in STAFF_ROLES for role in member.roles)
 
 
-async def deny_staff(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        f"🧹 {BOT_PERSONA} pede desculpas, mas apenas **Diretor, Vice-Diretor, Professores e Monitores** podem usar os comandos da moderação.",
-        ephemeral=True,
-    )
+def parse_datetime(data: str, hora: str) -> datetime:
+    return datetime.strptime(f"{data} {hora}", "%d/%m/%Y %H:%M").replace(tzinfo=FUSO_BRASILIA)
 
 
-def parse_datetime(data: str, horario: str) -> datetime:
-    return datetime.strptime(f"{data} {horario}", "%d/%m/%Y %H:%M")
+def format_dt(dt_str: str) -> str:
+    return from_db_dt(dt_str).strftime("%d/%m/%Y às %H:%M")
 
 
-def fmt_db(dt: datetime) -> str:
-    return dt.strftime(DATE_FMT_DB)
-
-
-def fmt_human(dt_str: str) -> str:
-    return datetime.strptime(dt_str, DATE_FMT_DB).strftime("%d/%m/%Y às %H:%M")
-
-
-def record_title(row: sqlite3.Row) -> str:
-    return f"{row['titulo']} • {datetime.strptime(row['starts_at'], DATE_FMT_DB).strftime('%d/%m %H:%M')}"
-
-
-def voice_channel_text(guild: discord.Guild, channel_id: Optional[int]) -> str:
-    if not channel_id:
+def voice_mention(guild: discord.Guild, voice_channel_id: Optional[int]) -> str:
+    if not voice_channel_id:
         return "Não informado"
-    channel = guild.get_channel(channel_id)
-    return channel.mention if channel else "Canal não encontrado"
+    ch = guild.get_channel(voice_channel_id)
+    return ch.mention if ch else "Canal não encontrado"
 
 
-def participant_mentions(guild: discord.Guild, row: sqlite3.Row) -> str:
-    ids = [int(x) for x in (row["participant_ids"] or "").split(",") if x.strip()]
-    mentions = []
-    for uid in ids:
-        member = guild.get_member(uid)
-        mentions.append(member.mention if member else f"<@{uid}>")
-    return ", ".join(mentions) if mentions else "Não informado"
+def record_label(row: sqlite3.Row) -> str:
+    dt = from_db_dt(row["starts_at"]).strftime("%d/%m %H:%M")
+    return f"{row['titulo']} • {dt}"
 
 
-def build_record_embed(guild: discord.Guild, row: sqlite3.Row) -> discord.Embed:
-    titles = {
-        "aula": "📚 Aula registrada na Agenda Mágica",
-        "reuniao": "🪄 Reunião registrada na Agenda Mágica",
-        "individual": "📌 Aviso registrado na Agenda Mágica",
-    }
-    embed = discord.Embed(
-        title=titles.get(row["kind"], "📜 Registro na Agenda Mágica"),
-        description=f"{BOT_PERSONA} organizou tudo direitinho para você.",
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(name="Título", value=row["titulo"], inline=False)
-    embed.add_field(name="Quando", value=fmt_human(row["starts_at"]), inline=True)
-    embed.add_field(name="Aviso antecipado", value=f"{row['notify_before']} min", inline=True)
-    embed.add_field(name="Canal de voz", value=voice_channel_text(guild, row["voice_channel_id"]), inline=False)
-    if row["kind"] == "aula" and row["role_id"]:
-        role = guild.get_role(row["role_id"])
-        embed.add_field(name="Público", value=role.mention if role else "Cargo não encontrado", inline=False)
-    elif row["kind"] in {"reuniao", "individual"}:
-        embed.add_field(name="Participantes", value=participant_mentions(guild, row), inline=False)
-    if row["descricao"]:
-        embed.add_field(name="Observações", value=row["descricao"], inline=False)
-    embed.set_footer(text=f"{BOT_PERSONA} está feliz em ajudar com a {SYSTEM_NAME}.")
-    return embed
-
-
-async def send_dm_safe(user: discord.abc.User, embed: discord.Embed):
+async def send_dm_safe(member: discord.Member, embed: discord.Embed):
     try:
-        await user.send(embed=embed)
+        await member.send(embed=embed)
         return True
     except Exception:
         return False
 
 
-async def notify_user_before(user: discord.abc.User, titulo: str, quando: str, minutos: int, canal: str):
+def build_reminder_embed(title: str, description: str, when: str, guild: discord.Guild, voice_id: Optional[int]) -> discord.Embed:
     embed = discord.Embed(
         title="🦉 Sua coruja trouxe um lembrete",
-        description=f"{BOT_PERSONA} avisa que **{titulo}** começará em **{minutos} minutos**.",
+        description=description,
         color=discord.Color.gold(),
     )
-    embed.add_field(name="Quando", value=quando, inline=True)
-    embed.add_field(name="Canal de voz", value=canal, inline=False)
-    embed.set_footer(text=f"{SYSTEM_NAME} • Hogwarts")
-    await send_dm_safe(user, embed)
+    embed.add_field(name="Compromisso", value=title, inline=False)
+    embed.add_field(name="Quando", value=when, inline=True)
+    embed.add_field(name="Canal de voz", value=voice_mention(guild, voice_id), inline=True)
+    embed.set_footer(text=f"{BOT_PERSONA} cuida da {SYSTEM_NAME} de Hogwarts")
+    return embed
 
 
-async def notify_user_start(user: discord.abc.User, titulo: str, quando: str, canal: str):
-    embed = discord.Embed(
-        title="🦉 Sua coruja voltou com outro aviso",
-        description=f"{BOT_PERSONA} avisa que **{titulo}** começa agora.",
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(name="Horário", value=quando, inline=True)
-    embed.add_field(name="Canal de voz", value=canal, inline=False)
-    embed.set_footer(text=f"{SYSTEM_NAME} • Hogwarts")
-    await send_dm_safe(user, embed)
-
-
-async def dispatch_notifications(row: sqlite3.Row, before: bool):
-    guild = bot.get_guild(row["guild_id"])
-    if guild is None:
-        return
-
-    canal_texto = voice_channel_text(guild, row["voice_channel_id"])
-    quando = fmt_human(row["starts_at"])
-    ids: list[int] = []
+async def notify_record(row: sqlite3.Row, guild: discord.Guild, *, started: bool = False):
+    when = format_dt(row["starts_at"])
+    title = row["titulo"]
+    voice_id = row["voice_channel_id"]
 
     if row["kind"] == "aula" and row["role_id"]:
-        role = guild.get_role(row["role_id"])
-        if role:
-            ids = [member.id for member in role.members if not member.bot]
+        role = guild.get_role(int(row["role_id"]))
+        members = [m for m in guild.members if role in m.roles] if role else []
+        text = (
+            f"{BOT_PERSONA} avisa que uma aula da {SYSTEM_NAME} {'está começando agora' if started else 'vai começar em breve'}!"
+        )
+        for m in members:
+            embed = build_reminder_embed(title, text, when, guild, voice_id)
+            await send_dm_safe(m, embed)
     else:
         ids = [int(x) for x in (row["participant_ids"] or "").split(",") if x.strip()]
-
-    for uid in ids:
-        member = guild.get_member(uid)
-        if member is None:
-            try:
-                member = await bot.fetch_user(uid)
-            except Exception:
-                continue
-        try:
-            if before:
-                await notify_user_before(member, row["titulo"], quando, row["notify_before"], canal_texto)
-            else:
-                await notify_user_start(member, row["titulo"], quando, canal_texto)
-        except Exception:
-            continue
+        for uid in ids:
+            member = guild.get_member(uid)
+            if member:
+                text = (
+                    f"{BOT_PERSONA} avisa que um compromisso da {SYSTEM_NAME} {'está começando agora' if started else 'vai começar em breve'}."
+                )
+                embed = build_reminder_embed(title, text, when, guild, voice_id)
+                await send_dm_safe(member, embed)
 
 
-async def sync_commands_for_all_guilds():
-    total = 0
-    for guild in bot.guilds:
-        try:
-            discord_guild = discord.Object(id=guild.id)
-            bot.tree.copy_global_to(guild=discord_guild)
-            synced = await bot.tree.sync(guild=discord_guild)
-            total += len(synced)
-            print(f"Comandos sincronizados em {guild.name}: {len(synced)}")
-        except Exception as exc:
-            print(f"Erro ao sincronizar em {guild.name}: {exc}")
-    return total
+async def staff_check(interaction: discord.Interaction) -> bool:
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not is_staff(member):
+        await interaction.response.send_message(
+            f"🧹 {BOT_PERSONA} pede desculpas, mas apenas **Monitor, Professor, Diretor e Funcionário** podem usar este comando.",
+            ephemeral=True,
+        )
+        return False
+    return True
 
 
-# =========================
-# Autocomplete
-# =========================
-async def registro_autocomplete(
+async def record_autocomplete(
     interaction: discord.Interaction,
     current: str,
-) -> list[app_commands.Choice[str]]:
-    if interaction.guild is None:
-        return []
-    registros = db.autocomplete_records(interaction.guild.id)
-    opcoes = []
-    current_lower = current.lower().strip()
-    for row in registros:
-        label = record_title(row)
-        if current_lower and current_lower not in label.lower() and current_lower not in row["titulo"].lower():
-            continue
-        opcoes.append(app_commands.Choice(name=label[:100], value=str(row["id"])))
-    return opcoes[:25]
-
-
-# =========================
-# Eventos do bot
-# =========================
-@bot.event
-async def on_ready():
-    total = await sync_commands_for_all_guilds()
-    if not reminder_loop.is_running():
-        reminder_loop.start()
-    print(f"Bot conectado como {bot.user}")
-    print(f"Total de registros de comandos sincronizados: {total}")
-
-
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    try:
-        discord_guild = discord.Object(id=guild.id)
-        bot.tree.copy_global_to(guild=discord_guild)
-        synced = await bot.tree.sync(guild=discord_guild)
-        print(f"Sincronizado em novo servidor {guild.name}: {len(synced)}")
-    except Exception as exc:
-        print(f"Erro ao sincronizar novo servidor {guild.name}: {exc}")
-
-
-# =========================
-# Loop de lembretes
-# =========================
-@tasks.loop(seconds=30)
-async def reminder_loop():
-    now = datetime.now()
-    for row in db.pending_notifications():
-        starts_at = datetime.strptime(row["starts_at"], DATE_FMT_DB)
-        notify_at = starts_at - timedelta(minutes=row["notify_before"])
-
-        if row["notify_sent"] == 0 and now >= notify_at and now < starts_at:
-            await dispatch_notifications(row, before=True)
-            db.mark_notify_sent(row["id"])
-
-        if row["start_sent"] == 0 and now >= starts_at:
-            await dispatch_notifications(row, before=False)
-            db.mark_start_sent(row["id"])
-
-    db.cleanup_old()
+) -> List[app_commands.Choice[str]]:
+    rows = db.autocomplete_records()
+    choices = []
+    for row in rows:
+        label = record_label(row)
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(row["id"])))
+    return choices[:25]
 
 
 # =========================
@@ -511,21 +355,20 @@ async def reminder_loop():
 @bot.tree.command(name="ajuda_agenda", description="Mispy explica como usar a Agenda Mágica")
 async def ajuda_agenda(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🧹 Mispy explica a Agenda Mágica",
+        title="🧹 Como usar a Agenda Mágica",
         description=(
-            "Mispy está feliz em ajudar com aulas, reuniões e avisos do castelo.\n\n"
+            f"{BOT_PERSONA} está feliz em ajudar! A **{SYSTEM_NAME}** organiza aulas, reuniões e compromissos em Hogwarts.\n\n"
             "**Comandos da moderação**\n"
-            "`/aula_criar` cria aula para um cargo.\n"
-            "`/reuniao_criar` agenda encontro entre pessoas.\n"
-            "`/aviso_individual` cria lembrete privado.\n"
-            "`/registro_editar` altera horário, canal ou antecedência.\n"
-            "`/registro_cancelar` cancela um registro.\n"
-            "`/agenda_staff` mostra os próximos registros do servidor.\n\n"
+            "`/aula_criar` cria um lembrete de aula para um cargo.\n"
+            "`/reuniao_criar` agenda um encontro entre pessoas específicas.\n"
+            "`/registro_editar` altera data, horário, canal ou detalhes.\n"
+            "`/registro_cancelar` cancela um registro sem mostrar ID.\n"
+            "`/agenda_staff` mostra os próximos registros da staff.\n\n"
             "**Comandos dos membros**\n"
             "`/minha_agenda` mostra seus próximos compromissos.\n"
             "`/agenda_hoje` mostra o que você tem hoje.\n\n"
-            "**Coruja da Agenda**\n"
-            "Os avisos chegam na DM antes do evento e novamente quando ele começa."
+            f"**Observação de {BOT_PERSONA}**\n"
+            "Registros passados são limpos automaticamente para manter a agenda organizada."
         ),
         color=discord.Color.blurple(),
     )
@@ -533,289 +376,296 @@ async def ajuda_agenda(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="aula_criar", description="Criar uma aula para um cargo")
+@bot.tree.command(name="aula_criar", description="Criar lembrete de aula para um cargo")
 @app_commands.describe(
     titulo="Nome da aula",
-    cargo="Cargo que receberá o lembrete",
+    cargo="Cargo que receberá a aula",
     data="Data no formato DD/MM/AAAA",
-    horario="Horário no formato HH:MM",
+    hora="Hora no formato HH:MM",
     canal_voz="Canal de voz da aula",
-    antecedencia="Minutos antes do começo para avisar",
-    descricao="Observações opcionais",
+    descricao="Detalhes opcionais",
 )
 async def aula_criar(
     interaction: discord.Interaction,
     titulo: str,
     cargo: discord.Role,
     data: str,
-    horario: str,
+    hora: str,
     canal_voz: discord.VoiceChannel,
-    antecedencia: app_commands.Range[int, 0, 1440] = ANTECEDENCIA_PADRAO,
     descricao: Optional[str] = None,
 ):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await deny_staff(interaction)
+    if not await staff_check(interaction):
         return
     try:
-        starts_at = parse_datetime(data, horario)
+        dt = parse_datetime(data, hora)
     except ValueError:
-        await interaction.response.send_message("Use a data como **DD/MM/AAAA** e o horário como **HH:MM**.", ephemeral=True)
+        await interaction.response.send_message("Use a data como **DD/MM/AAAA** e a hora como **HH:MM**.", ephemeral=True)
         return
 
-    record_id = db.create_record(
-        guild_id=interaction.guild.id,
+    db.create_record(
         kind="aula",
         titulo=titulo,
         descricao=descricao or "",
-        starts_at=starts_at,
+        starts_at=dt,
         voice_channel_id=canal_voz.id,
         role_id=cargo.id,
         participant_ids=[],
         created_by=interaction.user.id,
-        notify_before=antecedencia,
+        notify_before=ANTECEDENCIA_PADRAO,
     )
-    row = db.record_by_id(record_id, interaction.guild.id)
-    embed = build_record_embed(interaction.guild, row)
-    embed.description = f"{BOT_PERSONA} anotou a aula na **{SYSTEM_NAME}** e vai avisar quem tiver o cargo {cargo.mention}."
-    await interaction.response.send_message(embed=embed)
+
+    embed = discord.Embed(
+        title="📚 Aula registrada na Agenda Mágica",
+        description=f"{BOT_PERSONA} anotou a aula e enviará uma coruja aos membros do cargo escolhido.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Aula", value=titulo, inline=False)
+    embed.add_field(name="Cargo", value=cargo.mention, inline=True)
+    embed.add_field(name="Quando", value=dt.astimezone(FUSO_BRASILIA).strftime("%d/%m/%Y às %H:%M"), inline=True)
+    embed.add_field(name="Canal de voz", value=canal_voz.mention, inline=False)
+    if descricao:
+        embed.add_field(name="Detalhes", value=descricao, inline=False)
+    embed.set_footer(text=f"{BOT_PERSONA} está feliz em ajudar!")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="reuniao_criar", description="Criar uma reunião entre duas pessoas")
+@bot.tree.command(name="reuniao_criar", description="Agendar reunião entre pessoas específicas")
 @app_commands.describe(
     titulo="Assunto da reunião",
-    participante1="Primeiro participante",
-    participante2="Segundo participante",
+    participante_1="Primeira pessoa",
+    participante_2="Segunda pessoa",
     data="Data no formato DD/MM/AAAA",
-    horario="Horário no formato HH:MM",
+    hora="Hora no formato HH:MM",
     canal_voz="Canal de voz da reunião",
-    antecedencia="Minutos antes do começo para avisar",
-    descricao="Observações opcionais",
+    descricao="Detalhes opcionais",
 )
 async def reuniao_criar(
     interaction: discord.Interaction,
     titulo: str,
-    participante1: discord.Member,
-    participante2: discord.Member,
+    participante_1: discord.Member,
+    participante_2: discord.Member,
     data: str,
-    horario: str,
+    hora: str,
     canal_voz: discord.VoiceChannel,
-    antecedencia: app_commands.Range[int, 0, 1440] = ANTECEDENCIA_PADRAO,
     descricao: Optional[str] = None,
 ):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await deny_staff(interaction)
+    if not await staff_check(interaction):
         return
     try:
-        starts_at = parse_datetime(data, horario)
+        dt = parse_datetime(data, hora)
     except ValueError:
-        await interaction.response.send_message("Use a data como **DD/MM/AAAA** e o horário como **HH:MM**.", ephemeral=True)
+        await interaction.response.send_message("Use a data como **DD/MM/AAAA** e a hora como **HH:MM**.", ephemeral=True)
         return
 
-    participants = list(dict.fromkeys([participante1.id, participante2.id]))
-    record_id = db.create_record(
-        guild_id=interaction.guild.id,
+    db.create_record(
         kind="reuniao",
         titulo=titulo,
         descricao=descricao or "",
-        starts_at=starts_at,
+        starts_at=dt,
         voice_channel_id=canal_voz.id,
         role_id=None,
-        participant_ids=participants,
+        participant_ids=[participante_1.id, participante_2.id],
         created_by=interaction.user.id,
-        notify_before=antecedencia,
+        notify_before=ANTECEDENCIA_PADRAO,
     )
-    row = db.record_by_id(record_id, interaction.guild.id)
-    embed = build_record_embed(interaction.guild, row)
-    embed.description = f"{BOT_PERSONA} registrou a reunião e mandará corujas para os participantes na hora certa."
-    await interaction.response.send_message(embed=embed)
 
-
-@bot.tree.command(name="aviso_individual", description="Criar um lembrete privado para uma pessoa")
-@app_commands.describe(
-    titulo="Título do lembrete",
-    pessoa="Pessoa que vai receber a coruja",
-    data="Data no formato DD/MM/AAAA",
-    horario="Horário no formato HH:MM",
-    antecedencia="Minutos antes do começo para avisar",
-    canal_voz="Canal de voz opcional",
-    descricao="Observações opcionais",
-)
-async def aviso_individual(
-    interaction: discord.Interaction,
-    titulo: str,
-    pessoa: discord.Member,
-    data: str,
-    horario: str,
-    antecedencia: app_commands.Range[int, 0, 1440] = ANTECEDENCIA_PADRAO,
-    canal_voz: Optional[discord.VoiceChannel] = None,
-    descricao: Optional[str] = None,
-):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await deny_staff(interaction)
-        return
-    try:
-        starts_at = parse_datetime(data, horario)
-    except ValueError:
-        await interaction.response.send_message("Use a data como **DD/MM/AAAA** e o horário como **HH:MM**.", ephemeral=True)
-        return
-
-    record_id = db.create_record(
-        guild_id=interaction.guild.id,
-        kind="individual",
-        titulo=titulo,
-        descricao=descricao or "",
-        starts_at=starts_at,
-        voice_channel_id=canal_voz.id if canal_voz else None,
-        role_id=None,
-        participant_ids=[pessoa.id],
-        created_by=interaction.user.id,
-        notify_before=antecedencia,
-    )
-    row = db.record_by_id(record_id, interaction.guild.id)
-    embed = build_record_embed(interaction.guild, row)
-    embed.description = f"{BOT_PERSONA} já separou uma coruja para lembrar {pessoa.mention}."
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="agenda_staff", description="Ver os próximos registros do servidor")
-async def agenda_staff(interaction: discord.Interaction):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await deny_staff(interaction)
-        return
-    rows = db.upcoming_staff(interaction.guild.id)
-    if not rows:
-        await interaction.response.send_message(f"🧹 {BOT_PERSONA} não encontrou registros futuros neste servidor.", ephemeral=True)
-        return
     embed = discord.Embed(
-        title=f"📚 {SYSTEM_NAME} do servidor",
-        description=f"{BOT_PERSONA} separou os próximos compromissos deste castelo.",
-        color=discord.Color.dark_teal(),
-    )
-    for row in rows[:10]:
-        tipo = {"aula": "Aula", "reuniao": "Reunião", "individual": "Aviso"}.get(row["kind"], "Registro")
-        embed.add_field(
-            name=f"{tipo} • {row['titulo']}",
-            value=f"{fmt_human(row['starts_at'])}\nCanal: {voice_channel_text(interaction.guild, row['voice_channel_id'])}",
-            inline=False,
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="minha_agenda", description="Ver seus próximos lembretes")
-async def minha_agenda(interaction: discord.Interaction):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Este comando funciona dentro de um servidor.", ephemeral=True)
-        return
-    rows = db.upcoming_for_user(interaction.guild.id, interaction.user.id)
-    if not rows:
-        await interaction.response.send_message(f"🧹 {BOT_PERSONA} não encontrou compromissos futuros para você neste servidor.", ephemeral=True)
-        return
-    embed = discord.Embed(
-        title="📜 Sua Agenda Mágica",
-        description=f"{BOT_PERSONA} separou seus próximos compromissos.",
+        title="🗓️ Reunião registrada na Agenda Mágica",
+        description=f"{BOT_PERSONA} registrou a reunião e avisará os participantes por coruja.",
         color=discord.Color.purple(),
     )
-    for row in rows[:10]:
-        embed.add_field(
-            name=row["titulo"],
-            value=f"{fmt_human(row['starts_at'])}\nCanal: {voice_channel_text(interaction.guild, row['voice_channel_id'])}",
-            inline=False,
-        )
+    embed.add_field(name="Assunto", value=titulo, inline=False)
+    embed.add_field(name="Participantes", value=f"{participante_1.mention} e {participante_2.mention}", inline=False)
+    embed.add_field(name="Quando", value=dt.astimezone(FUSO_BRASILIA).strftime("%d/%m/%Y às %H:%M"), inline=True)
+    embed.add_field(name="Canal de voz", value=canal_voz.mention, inline=True)
+    if descricao:
+        embed.add_field(name="Detalhes", value=descricao, inline=False)
+    embed.set_footer(text=f"{BOT_PERSONA} está feliz em ajudar!")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="agenda_hoje", description="Ver seus lembretes de hoje")
-async def agenda_hoje(interaction: discord.Interaction):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Este comando funciona dentro de um servidor.", ephemeral=True)
-        return
-    rows = db.today_for_user(interaction.guild.id, interaction.user.id)
-    if not rows:
-        await interaction.response.send_message(f"🧹 {BOT_PERSONA} não encontrou compromissos para hoje neste servidor.", ephemeral=True)
-        return
-    embed = discord.Embed(
-        title="🗓️ Seus compromissos de hoje",
-        description=f"{BOT_PERSONA} já colocou tudo em ordem para hoje.",
-        color=discord.Color.green(),
-    )
-    for row in rows[:10]:
-        embed.add_field(
-            name=row["titulo"],
-            value=f"{fmt_human(row['starts_at'])}\nCanal: {voice_channel_text(interaction.guild, row['voice_channel_id'])}",
-            inline=False,
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="registro_editar", description="Editar um registro da Agenda Mágica")
-@app_commands.autocomplete(registro=registro_autocomplete)
+@bot.tree.command(name="registro_editar", description="Editar um registro existente")
 @app_commands.describe(
-    registro="Escolha o registro",
+    registro="Selecione o registro",
     titulo="Novo título",
     data="Nova data DD/MM/AAAA",
-    horario="Novo horário HH:MM",
+    hora="Nova hora HH:MM",
     canal_voz="Novo canal de voz",
-    antecedencia="Nova antecedência em minutos",
-    descricao="Novas observações",
+    descricao="Nova descrição",
 )
+@app_commands.autocomplete(registro=record_autocomplete)
 async def registro_editar(
     interaction: discord.Interaction,
     registro: str,
     titulo: Optional[str] = None,
     data: Optional[str] = None,
-    horario: Optional[str] = None,
+    hora: Optional[str] = None,
     canal_voz: Optional[discord.VoiceChannel] = None,
-    antecedencia: Optional[app_commands.Range[int, 0, 1440]] = None,
     descricao: Optional[str] = None,
 ):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await deny_staff(interaction)
+    if not await staff_check(interaction):
         return
-    row = db.record_by_id(int(registro), interaction.guild.id)
-    if row is None:
-        await interaction.response.send_message("🧹 Mispy não encontrou esse registro neste servidor.", ephemeral=True)
+    row = db.get_record(int(registro))
+    if not row or row["canceled"]:
+        await interaction.response.send_message("{BOT_PERSONA} não encontrou esse registro.", ephemeral=True)
         return
 
     starts_at = None
-    if data and horario:
+    if data and hora:
         try:
-            starts_at = parse_datetime(data, horario)
+            starts_at = parse_datetime(data, hora)
         except ValueError:
-            await interaction.response.send_message("Use a data como **DD/MM/AAAA** e o horário como **HH:MM**.", ephemeral=True)
+            await interaction.response.send_message("Use a data como **DD/MM/AAAA** e a hora como **HH:MM**.", ephemeral=True)
             return
-    elif data or horario:
-        await interaction.response.send_message("Para alterar a data, envie **data e horário juntos**.", ephemeral=True)
+    elif data or hora:
+        await interaction.response.send_message("Para alterar data e hora, informe os dois campos juntos.", ephemeral=True)
         return
 
     db.update_record(
         int(registro),
-        interaction.guild.id,
         titulo=titulo,
         descricao=descricao,
         starts_at=starts_at,
         voice_channel_id=canal_voz.id if canal_voz else None,
-        notify_before=antecedencia,
     )
-    updated = db.record_by_id(int(registro), interaction.guild.id)
-    embed = build_record_embed(interaction.guild, updated)
-    embed.description = f"{BOT_PERSONA} atualizou o registro sem bagunçar os pergaminhos da {SYSTEM_NAME}."
-    await interaction.response.send_message(embed=embed)
+
+    updated = db.get_record(int(registro))
+    embed = discord.Embed(
+        title="✏️ Registro atualizado",
+        description=f"{BOT_PERSONA} reorganizou este compromisso da {SYSTEM_NAME}.",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="Registro", value=updated["titulo"], inline=False)
+    embed.add_field(name="Quando", value=format_dt(updated["starts_at"]), inline=True)
+    embed.add_field(name="Canal de voz", value=voice_mention(interaction.guild, updated["voice_channel_id"]), inline=True)
+    if updated["descricao"]:
+        embed.add_field(name="Detalhes", value=updated["descricao"], inline=False)
+    embed.set_footer(text=f"{BOT_PERSONA} está feliz em ajudar!")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="registro_cancelar", description="Cancelar um registro da Agenda Mágica")
-@app_commands.autocomplete(registro=registro_autocomplete)
+@bot.tree.command(name="registro_cancelar", description="Cancelar um registro existente")
+@app_commands.describe(registro="Selecione o registro")
+@app_commands.autocomplete(registro=record_autocomplete)
 async def registro_cancelar(interaction: discord.Interaction, registro: str):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
-        await deny_staff(interaction)
+    if not await staff_check(interaction):
         return
-    row = db.record_by_id(int(registro), interaction.guild.id)
-    if row is None:
-        await interaction.response.send_message("🧹 Mispy não encontrou esse registro neste servidor.", ephemeral=True)
+    row = db.get_record(int(registro))
+    if not row or row["canceled"]:
+        await interaction.response.send_message(f"{BOT_PERSONA} não encontrou esse registro.", ephemeral=True)
         return
-    db.cancel_record(int(registro), interaction.guild.id)
+    db.cancel_record(int(registro))
     await interaction.response.send_message(
-        f"🧹 {BOT_PERSONA} cancelou **{row['titulo']}** e guardou esse pergaminho para não poluir a agenda.",
+        f"🧹 {BOT_PERSONA} cancelou **{row['titulo']}** e removeu o compromisso da {SYSTEM_NAME}.",
         ephemeral=True,
     )
 
-bot.run(TOKEN)
+
+@bot.tree.command(name="agenda_staff", description="Ver próximos registros da staff")
+async def agenda_staff(interaction: discord.Interaction):
+    if not await staff_check(interaction):
+        return
+    rows = db.upcoming_staff()
+    if not rows:
+        await interaction.response.send_message(f"🧹 {BOT_PERSONA} não encontrou registros futuros na {SYSTEM_NAME}.", ephemeral=True)
+        return
+    embed = discord.Embed(title="📜 Próximos registros da Agenda Mágica", color=discord.Color.blurple())
+    for row in rows[:10]:
+        embed.add_field(
+            name=record_label(row),
+            value=f"Tipo: **{row['kind'].title()}**\nCanal: {voice_mention(interaction.guild, row['voice_channel_id'])}",
+            inline=False,
+        )
+    embed.set_footer(text=f"{BOT_PERSONA} organizou os próximos registros.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="minha_agenda", description="Ver seus próximos compromissos")
+async def minha_agenda(interaction: discord.Interaction):
+    rows = db.upcoming_for_user(interaction.user.id)
+    if not rows:
+        await interaction.response.send_message(f"🧹 {BOT_PERSONA} não encontrou compromissos futuros para você.", ephemeral=True)
+        return
+    embed = discord.Embed(title="🗓️ Sua Agenda Mágica", color=discord.Color.blurple())
+    for row in rows[:10]:
+        embed.add_field(
+            name=row["titulo"],
+            value=f"Quando: **{format_dt(row['starts_at'])}**\nCanal: {voice_mention(interaction.guild, row['voice_channel_id'])}",
+            inline=False,
+        )
+    embed.set_footer(text=f"{BOT_PERSONA} separou seus próximos compromissos.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="agenda_hoje", description="Ver seus compromissos de hoje")
+async def agenda_hoje(interaction: discord.Interaction):
+    rows = db.today_for_user(interaction.user.id)
+    if not rows:
+        await interaction.response.send_message(f"🧹 {BOT_PERSONA} não encontrou compromissos para hoje.", ephemeral=True)
+        return
+    embed = discord.Embed(title="🌙 Seus compromissos de hoje", color=discord.Color.teal())
+    for row in rows:
+        embed.add_field(
+            name=row["titulo"],
+            value=f"Quando: **{format_dt(row['starts_at'])}**\nCanal: {voice_mention(interaction.guild, row['voice_channel_id'])}",
+            inline=False,
+        )
+    embed.set_footer(text=f"{BOT_PERSONA} organizou seus horários de hoje.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# =========================
+# Loops
+# =========================
+@tasks.loop(minutes=1)
+async def reminder_loop():
+    db.delete_old()
+    rows = db.pending_notifications()
+    for row in rows:
+        guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+        if not guild:
+            continue
+        starts_at = from_db_dt(row["starts_at"])
+        now = now_brasilia()
+        before_dt = starts_at - timedelta(minutes=int(row["notify_before"] or ANTECEDENCIA_PADRAO))
+
+        if not row["notify_sent"] and now >= before_dt and now < starts_at + timedelta(minutes=1):
+            await notify_record(row, guild, started=False)
+            with db._conn() as conn:
+                conn.execute("UPDATE registros SET notify_sent = 1 WHERE id = ?", (row["id"],))
+
+        if not row["start_sent"] and now >= starts_at:
+            await notify_record(row, guild, started=True)
+            with db._conn() as conn:
+                conn.execute("UPDATE registros SET start_sent = 1 WHERE id = ?", (row["id"],))
+
+
+@reminder_loop.before_loop
+async def before_reminder_loop():
+    await bot.wait_until_ready()
+
+
+# =========================
+# Eventos
+# =========================
+@bot.event
+async def on_ready():
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Comandos sincronizados no servidor: {len(synced)}")
+        else:
+            synced = await bot.tree.sync()
+            print(f"Comandos globais sincronizados: {len(synced)}")
+    except Exception as exc:
+        print(f"Erro ao sincronizar comandos: {exc}")
+
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+
+    print(f"Bot conectado como {bot.user}")
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
