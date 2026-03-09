@@ -357,18 +357,18 @@ async def ajuda_agenda(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🧹 Como usar a Agenda Mágica",
         description=(
-            f"{BOT_PERSONA} está feliz em ajudar! A **{SYSTEM_NAME}** organiza aulas, reuniões e compromissos em Hogwarts.\n\n"
+            f"{BOT_PERSONA} diz que a **{SYSTEM_NAME}** organiza aulas, reuniões e compromissos em Hogwarts.\n\n"
             "**Comandos da moderação**\n"
             "`/aula_criar` cria um lembrete de aula para um cargo.\n"
             "`/reuniao_criar` agenda um encontro entre pessoas específicas.\n"
             "`/registro_editar` altera data, horário, canal ou detalhes.\n"
-            "`/registro_cancelar` cancela um registro sem mostrar ID.\n"
+            "`/registro_cancelar` cancela um registro.\n"
             "`/agenda_staff` mostra os próximos registros da staff.\n\n"
             "**Comandos dos membros**\n"
             "`/minha_agenda` mostra seus próximos compromissos.\n"
             "`/agenda_hoje` mostra o que você tem hoje.\n\n"
             f"**Observação de {BOT_PERSONA}**\n"
-            "Registros passados são limpos automaticamente para manter a agenda organizada."
+            "Mispy limpa eventos passados automaticamente para manter a agenda organizada."
         ),
         color=discord.Color.blurple(),
     )
